@@ -11,27 +11,116 @@ workflow {
     reads_ch = Channel.fromFilePairs(params.reads, checkIfExists: true)
     ref_ch = Channel.fromPath(params.references, checkIfExists: true)
 
-    // 2. Process: Trim and Merge
+    // 2. Process: FastQC pre-trimming
+    FASTQC_PRE(reads_ch)
+
+    // 3. Process: Trim and Merge
     TRIM_AND_MERGE(reads_ch)
 
-    // 3. Process: Index Reference
+    // 4. Process: FastQC post-trimming
+    FASTQC_POST(TRIM_AND_MERGE.out.merged_reads)
+
+    // 5. Process: Index Reference
     INDEX_REF(ref_ch)
 
-    // 4. Process: Align Reads
-    ALIGN_READS(TRIM_AND_MERGE.out.merged_reads, INDEX_REF.out.index_files.collect())
+    // 6. Process: Align Reads
+    ALIGN_READS(
+        TRIM_AND_MERGE.out.merged_reads, 
+        INDEX_REF.out.ref.collect(),
+        INDEX_REF.out.index_files.collect()
+    )
 
-    // 5. Process: Filter BAM
+    // 7. Process: Filter BAM
     FILTER_BAM(ALIGN_READS.out.bam)
 
-    // 6. Process: Call Variants
-    CALL_VARIANTS(FILTER_BAM.out.filtered_bam, ref_ch)
+    // 8. Process: Flagstat pre-filtering
+    FLAGSTAT_PRE(ALIGN_READS.out.bam)
 
-    // 7. Process: Parse and Plot
+    // 9. Process: Flagstat post-filtering
+    FLAGSTAT_POST(FILTER_BAM.out.filtered_bam.map { it -> [it[0], it[1]] })
+
+    // 10. Process: Call Variants
+    CALL_VARIANTS(FILTER_BAM.out.filtered_bam, INDEX_REF.out.ref.collect(), INDEX_REF.out.fai.collect())
+
+    // 11. Process: Parse and Plot
     PARSE_AND_PLOT(
         CALL_VARIANTS.out.vcf, 
         FILTER_BAM.out.filtered_bam, 
-        ref_ch
+        INDEX_REF.out.ref.collect()
     )
+
+    // 12. Process: MultiQC
+    MULTIQC(
+        FASTQC_PRE.out.zip.collect().ifEmpty([]),
+        FASTQC_POST.out.zip.collect().ifEmpty([]),
+        TRIM_AND_MERGE.out.json.collect().ifEmpty([]),
+        FLAGSTAT_PRE.out.txt.collect().ifEmpty([]),
+        FLAGSTAT_POST.out.txt.collect().ifEmpty([])
+    )
+}
+
+process FLAGSTAT_PRE {
+    tag "$sample_id"
+
+    input:
+    tuple val(sample_id), path(bam)
+
+    output:
+    path "${sample_id}_pre_filtering.flagstat", emit: txt
+
+    script:
+    """
+    samtools flagstat $bam > ${sample_id}_pre_filtering.flagstat
+    """
+}
+
+process FLAGSTAT_POST {
+    tag "$sample_id"
+
+    input:
+    tuple val(sample_id), path(bam)
+
+    output:
+    path "${sample_id}_post_filtering.flagstat", emit: txt
+
+    script:
+    """
+    samtools flagstat $bam > ${sample_id}_post_filtering.flagstat
+    """
+}
+
+process FASTQC_PRE {
+    tag "$sample_id"
+    cpus 2
+
+    input:
+    tuple val(sample_id), path(reads)
+
+    output:
+    path "*.zip", emit: zip
+    path "*.html", emit: html
+
+    script:
+    """
+    fastqc -t $task.cpus $reads
+    """
+}
+
+process FASTQC_POST {
+    tag "$sample_id"
+    cpus 2
+
+    input:
+    tuple val(sample_id), path(reads)
+
+    output:
+    path "*.zip", emit: zip
+    path "*.html", emit: html
+
+    script:
+    """
+    fastqc -t $task.cpus $reads
+    """
 }
 
 process TRIM_AND_MERGE {
@@ -43,6 +132,8 @@ process TRIM_AND_MERGE {
 
     output:
     tuple val(sample_id), path("${sample_id}_merged.fastq.gz"), emit: merged_reads
+    path "${sample_id}_fastp.json"                            , emit: json
+    path "${sample_id}_fastp.html"                            , emit: html
     path "versions.yml"                                      , emit: versions
 
     script:
@@ -63,6 +154,7 @@ process TRIM_AND_MERGE {
     """
 }
 
+
 process INDEX_REF {
     tag "${ref.baseName}"
 
@@ -70,11 +162,14 @@ process INDEX_REF {
     path ref
 
     output:
+    path ref, emit: ref
+    path "${ref}.fai", emit: fai
     path "${ref}*", emit: index_files
 
     script:
     """
     bwa index $ref
+    samtools faidx $ref
     """
 }
 
@@ -84,19 +179,15 @@ process ALIGN_READS {
 
     input:
     tuple val(sample_id), path(merged_reads)
+    path ref
     path index_files
 
     output:
     tuple val(sample_id), path("${sample_id}_sorted.bam"), emit: bam
 
     script:
-    def ref_fasta = index_files.find { it.name.endsWith('.fa') || it.name.endsWith('.fasta') }
-    if (!ref_fasta) {
-        // Find by excluding bwa extensions
-        ref_fasta = index_files.find { ! (it.name.endsWith('.amb') || it.name.endsWith('.ann') || it.name.endsWith('.bwt') || it.name.endsWith('.pac') || it.name.endsWith('.sa')) }
-    }
     """
-    bwa mem -t $task.cpus $ref_fasta $merged_reads | \\
+    bwa mem -t $task.cpus $ref $merged_reads | \\
         samtools sort -@ $task.cpus -o ${sample_id}_sorted.bam -
     """
 }
@@ -123,14 +214,15 @@ process CALL_VARIANTS {
     input:
     tuple val(sample_id), path(bam), path(bai)
     path ref
+    path fai
 
     output:
-    tuple val(sample_id), path("${sample_id}.vcf.gz"), emit: vcf
+    tuple val(sample_id), path("${sample_id}.vcf.gz"), path("${sample_id}.vcf.gz.csi"), emit: vcf
 
     script:
     """
     bcftools mpileup -f $ref $bam | \\
-        bcftools call -m --ploidy ${params.ploidy} -Oz -o ${sample_id}.vcf.gz
+        bcftools call -m --ploidy 2 -Oz -o ${sample_id}.vcf.gz
     bcftools index ${sample_id}.vcf.gz
     """
 }
@@ -139,7 +231,7 @@ process PARSE_AND_PLOT {
     tag "$sample_id"
 
     input:
-    tuple val(sample_id), path(vcf)
+    tuple val(sample_id), path(vcf), path(vcf_idx)
     tuple val(sample_id), path(bam), path(bai)
     path ref
 
@@ -160,5 +252,22 @@ process PARSE_AND_PLOT {
     plot_summaries.py \\
         --input ${sample_id}_Alleles_frequency_table.tsv \\
         --output ${sample_id}_Editing_Frequencies.pdf
+    """
+}
+
+process MULTIQC {
+    input:
+    path 'fastqc_pre/*'
+    path 'fastqc_post/*'
+    path 'fastp/*'
+    path 'flagstat_pre/*'
+    path 'flagstat_post/*'
+
+    output:
+    path "multiqc_report.html", emit: report
+
+    script:
+    """
+    multiqc .
     """
 }

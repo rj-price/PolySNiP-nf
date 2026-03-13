@@ -17,9 +17,9 @@ A reproducible Nextflow pipeline designed for accurate alignment and quantificat
 
 ```bash
 nextflow run main.nf \
-    --reads 'data/*_{R1,R2}.fastq.gz' \
+    --reads 'data/*_{R1,R2}*.fastq.gz' \
     --references 'refs/homoeologues.fasta' \
-    --sgrna_seq 'GGTCCAGTAGTCCAGTGACG' \
+    --sgrna_seq 'AGAGTTGATGCTTCTGGGAT' \
     --ploidy 8 \
     -profile conda
 ```

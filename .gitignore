@@ -1,0 +1,7 @@
+data
+.nextflow*
+refs
+results
+slurm*
+*sh
+work
