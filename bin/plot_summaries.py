@@ -62,7 +62,12 @@ def plot_summaries(tsv_file, output_pdf):
 
     plt.tight_layout()
     plt.savefig(output_pdf)
-    print(f"Plots saved to {output_pdf}")
+    
+    # Also save as PNG for HTML report
+    output_png = output_pdf.replace(".pdf", ".png")
+    plt.savefig(output_png)
+    
+    print(f"Plots saved to {output_pdf} and {output_png}")
 
 
 if __name__ == "__main__":

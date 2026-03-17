@@ -37,17 +37,26 @@ def find_sgrna_cut_site(reference_fasta, sgrna_seq):
             
     return cut_sites
 
-def get_edit_status(vcf_file, bam_file, cut_sites, window_size):
+def get_edit_status(bam_file, reference_fasta, cut_sites, window_size):
     """
-    Parses VCF and BAM to count modified vs unmodified reads per homoeologue.
+    Parses BAM to count modified vs unmodified reads per homoeologue.
+    Also returns a detailed list of mutations found.
     """
-    results = []
+    summary_results = []
+    mutation_details = []
     
-    # Load VCF to find variants in the window
-    vcf_in = pysam.VariantFile(vcf_file)
+    # Load reference sequences into memory
+    ref_seqs = {record.id: str(record.seq) for record in SeqIO.parse(reference_fasta, "fasta")}
+    
+    # Open BAM file
+    sam_in = pysam.AlignmentFile(bam_file, "rb")
     
     # For each homoeologue
     for ref_id, cut_pos in cut_sites.items():
+        if ref_id not in ref_seqs:
+            print(f"Warning: {ref_id} not found in reference FASTA. Skipping.")
+            continue
+            
         win_start = cut_pos - window_size
         win_end = cut_pos + window_size
         
@@ -55,116 +64,131 @@ def get_edit_status(vcf_file, bam_file, cut_sites, window_size):
         unmodified = 0
         modified = 0
         
-        # Use BAM to iterate through reads mapping to this homoeologue
-        sam_in = pysam.AlignmentFile(bam_file, "rb")
-        
-        for read in sam_in.fetch(ref_id, win_start, win_end):
-            # Check if this read has a variant within the window
-            # We can check the CIGAR or look for VCF overlaps
-            # Simplest for CRISPR amplicons: does the read have any INDEL/SNP in the window?
-            
-            # Use VCF to see if there are any variants for this read? 
-            # Better: use the CIGAR and MD tags or just see if the read matches reference exactly in the window.
-            
-            # Check for any mismatches or indels in the specific window
-            is_modified = False
-            # Get aligned pairs for this read (read_pos, ref_pos)
-            aligned_pairs = read.get_aligned_pairs(with_seq=True)
-            
-            for read_pos, ref_pos, ref_base in aligned_pairs:
-                if ref_pos is not None and win_start <= ref_pos <= win_end:
-                    # If ref_pos is in window
-                    if read_pos is None: # Deletion
-                        is_modified = True
-                        break
-                    if ref_base is not None and ref_base.islower(): # Mismatch
-                        is_modified = True
-                        break
-                elif ref_pos is None and read_pos is not None:
-                    # Insertion - we need to check if it's near the window
-                    # This is trickier. Let's see if the previous/next ref_pos is in window.
-                    pass
+        # To store mutations for this homoeologue: (pos, type, length, change) -> count
+        mutation_counts = {}
 
-            # Count insertions by checking if they are between coordinates in the window
-            if not is_modified:
-                for cig_op, cig_len in read.cigartuples:
-                    if cig_op == 1: # Insertion
-                        # Find the reference position of this insertion
-                        # (Not easily available directly from cigartuples without walking)
-                        pass
-            
-            # Alternative: check if any VCF record overlaps this read in the window
-            # This relies on the variant caller.
-            
-            # Let's use the VCF records that overlap the window for this ref_id
-            variants_in_win = list(vcf_in.fetch(ref_id, win_start, win_end))
-            
-            # If any variant exists in the window, we'll check if the read supports it.
-            # But CRISPR amplicons often have complex variants.
-            
-            # Re-evaluating: The specification asks to "Count reads supporting the reference allele (Unmodified) 
-            # versus reads supporting indels/SNPs within the window (Modified)."
-            
-            # Let's check each read for any non-M (matches) in the window area
-            # A read is modified if its alignment in the window has I, D, or X.
-            
-            curr_ref_pos = read.reference_start
+        # Iterate through reads mapping to this homoeologue
+        for read in sam_in.fetch(ref_id, win_start, win_end + 1):
+            if read.is_unmapped:
+                continue
+
             read_is_modified = False
-            for op, length in read.cigartuples:
-                # 0: M, 1: I, 2: D, 3: N, 4: S, 5: H, 6: P, 7: =, 8: X
-                if op in [1, 2, 8]: # I, D, X
-                    # Calculate if this occurs in the window
-                    op_start = curr_ref_pos
-                    op_end = curr_ref_pos + (length if op != 1 else 0)
-                    
-                    if not (op_end < win_start or op_start > win_end):
-                        read_is_modified = True
-                        break
+            read_mutations = [] # Track mutations in this specific read to avoid double counting for summary
+            
+            pairs = read.get_aligned_pairs()
+            
+            # Walk through pairs to find mutations
+            i = 0
+            while i < len(pairs):
+                q_pos, r_pos = pairs[i]
                 
-                if op in [0, 2, 3, 7, 8]: # Consumes reference
-                    curr_ref_pos += length
+                # 1. Check for SNP or Deletion
+                if r_pos is not None and win_start <= r_pos <= win_end:
+                    # Deletion
+                    if q_pos is None:
+                        del_start = r_pos
+                        del_len = 0
+                        while i < len(pairs) and pairs[i][0] is None and pairs[i][1] is not None:
+                            del_len += 1
+                            i += 1
+                        
+                        read_mutations.append((del_start, "DEL", del_len, f"del_{del_len}bp"))
+                        read_is_modified = True
+                        continue # i already advanced
+                    
+                    # SNP
+                    else:
+                        ref_base = ref_seqs[ref_id][r_pos].upper()
+                        query_base = read.query_sequence[q_pos].upper()
+                        if ref_base != query_base:
+                            read_mutations.append((r_pos, "SNP", 1, f"{ref_base}>{query_base}"))
+                            read_is_modified = True
+                
+                # 2. Check for Insertion
+                elif r_pos is None and q_pos is not None:
+                    # Find if this insertion is at/in the window
+                    prev_r = pairs[i-1][1] if i > 0 else None
+                    next_r = pairs[i+1][1] if i < len(pairs) - 1 else None
+                    
+                    if (prev_r is not None and win_start <= prev_r <= win_end) or \
+                       (next_r is not None and win_start <= next_r <= win_end):
+                        
+                        ins_pos = prev_r if prev_r is not None else next_r
+                        ins_seq = ""
+                        ins_len = 0
+                        while i < len(pairs) and pairs[i][1] is None and pairs[i][0] is not None:
+                            ins_seq += read.query_sequence[pairs[i][0]]
+                            ins_len += 1
+                            i += 1
+                        
+                        read_mutations.append((ins_pos, "INS", ins_len, f"ins_{ins_seq}"))
+                        read_is_modified = True
+                        continue # i already advanced
+
+                i += 1
             
             if read_is_modified:
                 modified += 1
+                # Record the unique mutations for this read in the global tally
+                # (A read can have multiple mutations)
+                for mut in read_mutations:
+                    mutation_counts[mut] = mutation_counts.get(mut, 0) + 1
             else:
                 unmodified += 1
         
-        sam_in.close()
-        results.append({
+        total = modified + unmodified
+        summary_results.append({
             "Homoeologue": ref_id,
-            "Total_Reads": modified + unmodified,
+            "Total_Reads": total,
             "Unmodified_Reads": unmodified,
             "Modified_Reads": modified,
-            "Efficiency": (modified / (modified + unmodified) * 100) if (modified + unmodified) > 0 else 0
+            "Efficiency": (modified / total * 100) if total > 0 else 0
         })
+
+        # Add mutation details to the list
+        for (pos, mtype, mlen, mchange), count in mutation_counts.items():
+            mutation_details.append({
+                "Homoeologue": ref_id,
+                "Position": pos,
+                "Type": mtype,
+                "Length": mlen,
+                "Change": mchange,
+                "Count": count,
+                "Frequency (%)": (count / total * 100) if total > 0 else 0
+            })
         
-    return pd.DataFrame(results)
+    sam_in.close()
+    return pd.DataFrame(summary_results), pd.DataFrame(mutation_details)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parse VCF and BAM for CRISPR edits.")
-    parser.add_argument("--vcf", required=True, help="Input VCF file")
+    parser = argparse.ArgumentParser(description="Parse BAM for CRISPR edits.")
+    parser.add_argument("--vcf", help="Input VCF file (optional, not currently used)")
     parser.add_argument("--bam", required=True, help="Input BAM file")
     parser.add_argument("--ref", required=True, help="Reference FASTA")
     parser.add_argument("--sgrna", required=True, help="sgRNA sequence")
     parser.add_argument("--window", type=int, default=10, help="Quantification window size")
-    parser.add_argument("--output", required=True, help="Output TSV file")
+    parser.add_argument("--min_freq", type=float, default=0.5, help="Minimum frequency (%) to report a mutation in the details table")
+    parser.add_argument("--output", required=True, help="Output summary TSV file")
+    parser.add_argument("--output_details", required=True, help="Output detailed mutations TSV file")
     
     args = parser.parse_args()
     
-    # Needs Biopython for find_sgrna_cut_site
-    try:
-        from Bio import SeqIO
-    except ImportError:
-        print("Biopython is required. Please add it to the environment.")
-        sys.exit(1)
-        
     cut_sites = find_sgrna_cut_site(args.ref, args.sgrna)
     
     if not cut_sites:
-        print(f"Warning: sgRNA {args.sgrna} not found in reference.")
-        # Create empty output
-        df = pd.DataFrame(columns=["Homoeologue", "Total_Reads", "Unmodified_Reads", "Modified_Reads", "Efficiency"])
+        print(f"Error: sgRNA {args.sgrna} not found in reference.")
+        df_summary = pd.DataFrame(columns=["Homoeologue", "Total_Reads", "Unmodified_Reads", "Modified_Reads", "Efficiency"])
+        df_details = pd.DataFrame(columns=["Homoeologue", "Position", "Type", "Length", "Change", "Count", "Frequency (%)"])
     else:
-        df = get_edit_status(args.vcf, args.bam, cut_sites, args.window)
+        df_summary, df_details = get_edit_status(args.bam, args.ref, cut_sites, args.window)
         
-    df.to_csv(args.output, sep="\t", index=False)
+    df_summary.to_csv(args.output, sep="\t", index=False)
+    
+    # Filter details by frequency
+    if not df_details.empty:
+        df_details = df_details[df_details["Frequency (%)"] >= args.min_freq]
+        df_details.sort_values(["Homoeologue", "Position", "Count"], ascending=[True, True, False], inplace=True)
+    
+    df_details.to_csv(args.output_details, sep="\t", index=False)
+
+

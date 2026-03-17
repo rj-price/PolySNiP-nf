@@ -2,10 +2,6 @@
 
 nextflow.enable.dsl=2
 
-// Validation of required parameters
-if (params.references == null) { exit 1, "Please provide a reference FASTA file via --references" }
-if (params.sgrna_seq == null) { exit 1, "Please provide an sgRNA sequence via --sgrna_seq" }
-
 workflow {
     // 1. Create channels for input files
     reads_ch = Channel.fromFilePairs(params.reads, checkIfExists: true)
@@ -49,14 +45,34 @@ workflow {
         INDEX_REF.out.ref.collect()
     )
 
-    // 12. Process: MultiQC
+    // 12. Process: Coverage Depth
+    GET_COVERAGE(FILTER_BAM.out.filtered_bam)
+
+    // 13. Process: Final Report
+    report_inputs_ch = PARSE_AND_PLOT.out.tsv
+        .join(PARSE_AND_PLOT.out.details_tsv)
+        .join(PARSE_AND_PLOT.out.pdf)
+        .join(PARSE_AND_PLOT.out.png)
+        .join(GET_COVERAGE.out.png)
+        .join(FLAGSTAT_POST.out.txt)
+
+    FINAL_REPORT(report_inputs_ch)
+
+    // 14. Process: MultiQC
     MULTIQC(
         FASTQC_PRE.out.zip.collect().ifEmpty([]),
         FASTQC_POST.out.zip.collect().ifEmpty([]),
         TRIM_AND_MERGE.out.json.collect().ifEmpty([]),
-        FLAGSTAT_PRE.out.txt.collect().ifEmpty([]),
-        FLAGSTAT_POST.out.txt.collect().ifEmpty([])
+        FLAGSTAT_PRE.out.txt.map{ it[1] }.collect().ifEmpty([]),
+        FLAGSTAT_POST.out.txt.map{ it[1] }.collect().ifEmpty([])
     )
+
+    // 15. Workflow completion message
+    workflow.onComplete = {
+        println "Pipeline completed at: ${workflow.complete}"
+        println "Execution status: ${workflow.success ? 'OK' : 'failed'}"
+        println "Duration: ${workflow.duration}"
+    }
 }
 
 process FLAGSTAT_PRE {
@@ -66,7 +82,7 @@ process FLAGSTAT_PRE {
     tuple val(sample_id), path(bam)
 
     output:
-    path "${sample_id}_pre_filtering.flagstat", emit: txt
+    tuple val(sample_id), path("${sample_id}_pre_filtering.flagstat"), emit: txt
 
     script:
     """
@@ -81,7 +97,7 @@ process FLAGSTAT_POST {
     tuple val(sample_id), path(bam)
 
     output:
-    path "${sample_id}_post_filtering.flagstat", emit: txt
+    tuple val(sample_id), path("${sample_id}_post_filtering.flagstat"), emit: txt
 
     script:
     """
@@ -221,8 +237,9 @@ process CALL_VARIANTS {
 
     script:
     """
-    bcftools mpileup -f $ref $bam | \\
-        bcftools call -m --ploidy 2 -Oz -o ${sample_id}.vcf.gz
+    bcftools mpileup -B -a AD,DP -d 10000 -L 10000 -f $ref $bam | \\
+        bcftools call -mv | \\
+        bcftools filter -i 'MAX(FMT/AD[0:1-]) >= ${params.min_variant_reads}' -Oz -o ${sample_id}.vcf.gz
     bcftools index ${sample_id}.vcf.gz
     """
 }
@@ -236,8 +253,10 @@ process PARSE_AND_PLOT {
     path ref
 
     output:
-    path "${sample_id}_Alleles_frequency_table.tsv"      , emit: tsv
-    path "${sample_id}_Editing_Frequencies.pdf"         , emit: pdf
+    tuple val(sample_id), path("${sample_id}_Alleles_frequency_table.tsv")      , emit: tsv
+    tuple val(sample_id), path("${sample_id}_Mutation_Details_table.tsv")       , emit: details_tsv
+    tuple val(sample_id), path("${sample_id}_Editing_Frequencies.pdf")         , emit: pdf
+    tuple val(sample_id), path("${sample_id}_Editing_Frequencies.png")         , emit: png
 
     script:
     """
@@ -247,11 +266,55 @@ process PARSE_AND_PLOT {
         --ref $ref \\
         --sgrna "${params.sgrna_seq}" \\
         --window ${params.quant_window} \\
-        --output ${sample_id}_Alleles_frequency_table.tsv
+        --min_freq ${params.min_edit_freq} \\
+        --output ${sample_id}_Alleles_frequency_table.tsv \\
+        --output_details ${sample_id}_Mutation_Details_table.tsv
 
     plot_summaries.py \\
         --input ${sample_id}_Alleles_frequency_table.tsv \\
         --output ${sample_id}_Editing_Frequencies.pdf
+    """
+}
+
+process GET_COVERAGE {
+    tag "$sample_id"
+
+    input:
+    tuple val(sample_id), path(bam), path(bai)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_coverage.png"), emit: png
+
+    script:
+    """
+    samtools depth -a $bam > ${sample_id}_depth.txt
+    plot_coverage.py --input ${sample_id}_depth.txt --output ${sample_id}_coverage.png --sample $sample_id
+    """
+}
+
+process FINAL_REPORT {
+    tag "$sample_id"
+
+    input:
+    tuple val(sample_id), path(summary_tsv), path(details_tsv), path(edit_pdf), path(edit_png), path(cov_png), path(flagstat)
+
+    output:
+    path "${sample_id}_Final_Report.html", emit: html
+
+    script:
+    """
+    generate_report.py \\
+        --sample $sample_id \\
+        --sgrna "${params.sgrna_seq}" \\
+        --window ${params.quant_window} \\
+        --min_edit_freq ${params.min_edit_freq} \\
+        --min_variant_reads ${params.min_variant_reads} \\
+        --flagstat $flagstat \\
+        --edit_plot $edit_png \\
+        --summary_tsv $summary_tsv \\
+        --details_tsv $details_tsv \\
+        --cov_plot $cov_png \\
+        --output ${sample_id}_Final_Report.html
     """
 }
 

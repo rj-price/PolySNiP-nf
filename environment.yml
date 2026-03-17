@@ -3,6 +3,7 @@ channels:
   - conda-forge
   - bioconda
 dependencies:
+  - nextflow=25.10.4
   - fastp=0.23.4
   - fastqc=0.12.1
   - multiqc=1.19
