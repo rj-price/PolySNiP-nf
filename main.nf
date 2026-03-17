@@ -51,8 +51,10 @@ workflow {
     // 13. Process: Final Report
     report_inputs_ch = PARSE_AND_PLOT.out.tsv
         .join(PARSE_AND_PLOT.out.details_tsv)
+        .join(PARSE_AND_PLOT.out.alleles_tsv)
         .join(PARSE_AND_PLOT.out.pdf)
-        .join(PARSE_AND_PLOT.out.png)
+        .join(PARSE_AND_PLOT.out.edit_png)
+        .join(PARSE_AND_PLOT.out.allele_png)
         .join(GET_COVERAGE.out.png)
         .join(FLAGSTAT_POST.out.txt)
 
@@ -255,8 +257,10 @@ process PARSE_AND_PLOT {
     output:
     tuple val(sample_id), path("${sample_id}_Alleles_frequency_table.tsv")      , emit: tsv
     tuple val(sample_id), path("${sample_id}_Mutation_Details_table.tsv")       , emit: details_tsv
+    tuple val(sample_id), path("${sample_id}_Allele_Sequences.tsv")             , emit: alleles_tsv
     tuple val(sample_id), path("${sample_id}_Editing_Frequencies.pdf")         , emit: pdf
-    tuple val(sample_id), path("${sample_id}_Editing_Frequencies.png")         , emit: png
+    tuple val(sample_id), path("${sample_id}_Editing_Frequencies.png")         , emit: edit_png
+    tuple val(sample_id), path("${sample_id}_Allele_View.png")                 , emit: allele_png
 
     script:
     """
@@ -268,11 +272,19 @@ process PARSE_AND_PLOT {
         --window ${params.quant_window} \\
         --min_freq ${params.min_edit_freq} \\
         --output ${sample_id}_Alleles_frequency_table.tsv \\
-        --output_details ${sample_id}_Mutation_Details_table.tsv
+        --output_details ${sample_id}_Mutation_Details_table.tsv \\
+        --output_alleles ${sample_id}_Allele_Sequences.tsv
 
     plot_summaries.py \\
         --input ${sample_id}_Alleles_frequency_table.tsv \\
         --output ${sample_id}_Editing_Frequencies.pdf
+
+    plot_alleles.py \\
+        --input ${sample_id}_Allele_Sequences.tsv \\
+        --ref $ref \\
+        --sgrna "${params.sgrna_seq}" \\
+        --window ${params.quant_window} \\
+        --output ${sample_id}_Allele_View.png
     """
 }
 
@@ -296,7 +308,7 @@ process FINAL_REPORT {
     tag "$sample_id"
 
     input:
-    tuple val(sample_id), path(summary_tsv), path(details_tsv), path(edit_pdf), path(edit_png), path(cov_png), path(flagstat)
+    tuple val(sample_id), path(summary_tsv), path(details_tsv), path(alleles_tsv), path(edit_pdf), path(edit_png), path(allele_png), path(cov_png), path(flagstat)
 
     output:
     path "${sample_id}_Final_Report.html", emit: html
@@ -311,6 +323,7 @@ process FINAL_REPORT {
         --min_variant_reads ${params.min_variant_reads} \\
         --flagstat $flagstat \\
         --edit_plot $edit_png \\
+        --allele_plot $allele_png \\
         --summary_tsv $summary_tsv \\
         --details_tsv $details_tsv \\
         --cov_plot $cov_png \\

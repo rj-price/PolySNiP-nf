@@ -25,6 +25,7 @@ def generate_html(args):
     # Convert plots to base64
     edit_plot_b64 = image_to_base64(args.edit_plot)
     cov_plot_b64 = image_to_base64(args.cov_plot)
+    allele_plot_b64 = image_to_base64(args.allele_plot)
 
     # HTML Template
     html_template = f"""
@@ -85,6 +86,14 @@ def generate_html(args):
         </div>
 
         <div class="card">
+            <h2>Top Alleles Visualization</h2>
+            <p>Alignment of the most frequent alleles against the reference homoeologues. (Red: sgRNA, Blue line: Cut site, Gray: Match, Orange: SNP, Black: Deletion, Green: Insertion)</p>
+            <div class="plot-container">
+                <img src="data:image/png;base64,{allele_plot_b64}" alt="Allele View Plot">
+            </div>
+        </div>
+
+        <div class="card">
             <h2>Detailed Mutations (Filtered)</h2>
             <p>Showing mutations with frequency &ge; {args.min_edit_freq}%</p>
             {details_df.to_html(classes='table', index=False)}
@@ -111,6 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--min_variant_reads", required=True)
     parser.add_argument("--flagstat", required=True)
     parser.add_argument("--edit_plot", required=True)
+    parser.add_argument("--allele_plot", required=True)
     parser.add_argument("--summary_tsv", required=True)
     parser.add_argument("--details_tsv", required=True)
     parser.add_argument("--cov_plot", required=True)
